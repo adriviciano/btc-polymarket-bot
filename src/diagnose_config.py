@@ -37,12 +37,12 @@ def main():
     # 2. Derive addresses
     print("2. Deriving addresses from private key...")
     try:
-        from py_clob_client.client import ClobClient
+        from py_clob_client_v2.client import ClobClient
 
         client = ClobClient(
             "https://clob.polymarket.com",
-            key=private_key.strip(),
             chain_id=137,
+            key=private_key.strip(),
             signature_type=signature_type,
             funder=funder.strip() if funder else None,
         )
@@ -70,22 +70,33 @@ def main():
                 print("   ✓ POLYMARKET_FUNDER is set to a different address (good)")
                 print()
 
-        # 4. Get balance through API
-        print("4. Checking USDC balance via Polymarket API...")
+        # 4. Get balance through API (CLOB V2: sync balance/allowance first)
+        print("4. Checking pUSD balance via Polymarket API (CLOB V2)...")
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
 
-            derived_creds = client.create_or_derive_api_creds()
+            # V2 renamed create_or_derive_api_creds -> create_or_derive_api_key
+            derived_creds = client.create_or_derive_api_key()
             client.set_api_creds(derived_creds)
 
             params = BalanceAllowanceParams(
                 asset_type=AssetType.COLLATERAL,
                 signature_type=signature_type,
             )
+
+            # CLOB V2 reports a stale $0 until the balance/allowance is synced.
+            # This is the most common cause of "$0 balance" on a funded V2 wallet.
+            print("   → Syncing balance/allowance with the CLOB (V2)...")
+            try:
+                client.update_balance_allowance(params)
+                print("   ✓ Sync requested")
+            except Exception as sync_err:
+                print(f"   ⚠️ Sync failed (continuing): {sync_err}")
+
             result = client.get_balance_allowance(params)
             balance_raw = result.get("balance", "0") if isinstance(result, dict) else "0"
             balance_usdc = float(balance_raw) / 1_000_000
-            print(f"   💰 Polymarket API Balance: ${balance_usdc:.6f}")
+            print(f"   💰 Polymarket API Balance (pUSD): ${balance_usdc:.6f}")
         except Exception as e:
             print(f"   ❌ Error getting balance: {e}")
         print()

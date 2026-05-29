@@ -194,12 +194,21 @@ class SimpleArbitrageBot:
             return None, None, None, None
 
     def _levels_to_tuples(self, levels) -> list[tuple[float, float]]:
-        """Convert OrderSummary-like objects into (price, size) tuples."""
+        """Convert order book levels into (price, size) tuples.
+
+        CLOB V2's get_order_book returns plain dicts ({"price","size"}), while the
+        legacy V1 client returned OrderSummary objects (level.price / level.size).
+        Handle both shapes defensively.
+        """
         tuples: list[tuple[float, float]] = []
         for level in levels or []:
             try:
-                price = float(level.price)
-                size = float(level.size)
+                if isinstance(level, dict):
+                    price = float(level["price"])
+                    size = float(level["size"])
+                else:
+                    price = float(level.price)
+                    size = float(level.size)
             except Exception:
                 continue
             if size <= 0:
@@ -249,9 +258,14 @@ class SimpleArbitrageBot:
         """Get order book for a token."""
         try:
             book = self.client.get_order_book(token_id=token_id)
-            # The result is an OrderBookSummary object, not a dict
-            bids = book.bids if hasattr(book, 'bids') and book.bids else []
-            asks = book.asks if hasattr(book, 'asks') and book.asks else []
+            # CLOB V2 returns a plain dict ({"bids":[...], "asks":[...]}); the legacy
+            # V1 client returned an OrderBookSummary object. Support both.
+            if isinstance(book, dict):
+                bids = book.get("bids") or []
+                asks = book.get("asks") or []
+            else:
+                bids = book.bids if hasattr(book, 'bids') and book.bids else []
+                asks = book.asks if hasattr(book, 'asks') and book.asks else []
 
             bid_levels = self._levels_to_tuples(bids)
             ask_levels = self._levels_to_tuples(asks)

@@ -22,6 +22,45 @@ Profit:               $0.01 per share (1.01%)
 
 ---
 
+## 🆕 Polymarket CLOB V2 (April 28, 2026 migration)
+
+Polymarket migrated its trading infrastructure to **CLOB V2** on April 28, 2026. The
+legacy `py-clob-client` SDK and V1-signed orders **no longer work against production**.
+This bot has been migrated to the official V2 SDK (`py-clob-client-v2`).
+
+**What changed in this bot (automatic — you don't need to do anything):**
+- Uses `py-clob-client-v2` instead of `py-clob-client`.
+- The client still takes `chain_id=137` (Polygon) — V2 did **not** rename it to `chain`.
+- API-key derivation uses the renamed `create_or_derive_api_key()` method.
+- On startup the bot calls `/balance-allowance/update` (`update_balance_allowance`) to
+  refresh the CLOB's cached collateral balance/allowance, which can otherwise read a
+  stale `$0` for a funded wallet.
+- Balance and on-chain checks now target **pUSD**, the new collateral token.
+
+**What YOU must do manually (the bot cannot do these for you):**
+1. **Hold collateral as pUSD.** V2 collateral is **pUSD (Polymarket USD)**, an ERC-20 on
+   Polygon backed 1:1 by USDC, not the old USDC.e. On polymarket.com the UI wraps it for
+   you automatically. API-only traders wrap USDC.e → pUSD via the **Collateral Onramp**
+   contract's `wrap()` function.
+2. **Put the pUSD in the wallet the CLOB actually checks** for your `POLYMARKET_SIGNATURE_TYPE`
+   (your deposit/proxy wallet for proxy types, or your EOA for `signature_type=0`). See the
+   signature-type table below.
+
+**Key contract addresses on Polygon (Chain ID 137), verified against
+`py_clob_client_v2.config` and [docs.polymarket.com/resources/contracts](https://docs.polymarket.com/resources/contracts):**
+
+| Contract | Address |
+|----------|---------|
+| pUSD (collateral) | `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` |
+| Collateral Onramp (`wrap()`) | `0x93070a847efEf7F70739046A929D47a521F5B8ee` |
+| CTF Exchange V2 | `0xE111180000d2663C0091e4f400237545B87B996B` |
+| Neg Risk CTF Exchange V2 | `0xe2222d279d744050d28e00520010520000310F59` |
+
+> ℹ️ Always re-check the official contracts page before sending funds; addresses above are
+> what the installed V2 SDK uses.
+
+---
+
 ## 🚀 Installation
 
 ### 1. Clone the repository:
@@ -67,8 +106,12 @@ Then configure each variable (see detailed explanation below).
 
 | Variable | Description | Value |
 |----------|-------------|-------|
-| `POLYMARKET_SIGNATURE_TYPE` | Type of wallet signature | `0` = EOA (MetaMask, hardware wallet)<br>`1` = Magic.link (email login on Polymarket)<br>`2` = Gnosis Safe |
-| `POLYMARKET_FUNDER` | Proxy wallet address (only for Magic.link users) | Leave **empty** for EOA wallets. For Magic.link, see instructions below. |
+| `POLYMARKET_SIGNATURE_TYPE` | Type of wallet signature (CLOB V2 `SignatureTypeV2`) | `0` = EOA (MetaMask/hardware wallet signs and funds directly)<br>`1` = POLY_PROXY (EOA that owns a Polymarket proxy wallet — e.g. email/Magic login)<br>`2` = POLY_GNOSIS_SAFE (EOA that owns a Polymarket Gnosis Safe)<br>`3` = POLY_1271 (EIP-1271 smart-contract wallets / vaults) |
+| `POLYMARKET_FUNDER` | The wallet that **holds your pUSD** (proxy/Safe/vault address). | Leave **empty** for `signature_type=0` (EOA). For types `1`/`2`/`3`, set it to the address that holds your collateral. |
+
+> ⚠️ **The CLOB checks balance based on `signature_type` + `funder`.** If your pUSD lives in a
+> Polymarket proxy wallet but you run with `signature_type=0` (EOA), the CLOB checks your
+> empty EOA and reports `$0`. Match the signature type to the wallet that actually holds the pUSD.
 
 #### ⚠️ Important: Magic.link users (signature_type=1)
 
@@ -157,7 +200,7 @@ This will check:
 - Whether your `POLYMARKET_FUNDER` is correctly set (required for Magic.link accounts)
 - Whether the signer and funder addresses are different (they should be for Magic.link)
 - Whether the bot can detect `neg_risk` for BTC 15min markets
-- Your current USDC balance via the Polymarket API
+- Your current pUSD balance via the Polymarket API (after a CLOB V2 balance/allowance sync)
 
 **Common causes of "invalid signature":**
 1. `POLYMARKET_FUNDER` is empty for Magic.link accounts
@@ -200,11 +243,12 @@ API Passphrase: ✓
 3. Getting wallet address...
    ✓ Address: 0x52e78F6071719C...
 
-4. Getting USDC balance (COLLATERAL)...
-   💰 BALANCE USDC: $25.123456
+4. Getting pUSD balance (COLLATERAL)...
+   → Syncing balance/allowance with the CLOB (V2)...
+   💰 BALANCE pUSD: $25.123456
 
 5. Verifying balance directly on Polygon...
-   🔗 Balance on-chain: $25.123456
+   🔗 pUSD on-chain (0x...): $25.123456
 
 ======================================================================
 TEST COMPLETED
@@ -380,10 +424,19 @@ Bot/
 - Verify `POLYMARKET_SIGNATURE_TYPE` matches your wallet type
 - Regenerate API credentials with `python -m src.generate_api_key`
 
-### Balance shows $0 but I have funds
-- Check that your private key corresponds to the wallet with funds
-- For Magic.link: the private key is for your EOA, not the proxy wallet
-- Run `python -m src.test_balance` to see your wallet address
+### Balance shows $0 but I have funds (CLOB V2)
+Work through these in order:
+1. **Are your funds in pUSD?** V2 collateral is **pUSD**, not USDC.e. If your USDC.e was
+   never wrapped, the CLOB sees `$0`. Wrap on polymarket.com (automatic) or via the
+   Collateral Onramp `wrap()` for API-only flows.
+2. **Does `signature_type` match the wallet holding the pUSD?** The CLOB checks balance based
+   on `POLYMARKET_SIGNATURE_TYPE` + `POLYMARKET_FUNDER`. EOA (`0`) checks your signer address;
+   proxy types (`1`/`2`/`3`) check the `funder` address. A mismatch reports `$0`.
+3. **Verify on-chain.** Run `python -m src.test_balance` — it prints your wallet address and
+   queries pUSD directly on Polygon (requires `web3`; install with `pip install web3`). If
+   on-chain pUSD is `$0` for both your signer and funder, the funds are in a different wallet.
+4. The balance/allowance sync now runs automatically; a persistent `$0` after the sync means
+   the issue is one of the three above, not the SDK.
 
 ### "No active BTC 15min market found"
 - Markets open every 15 minutes; wait for the next one
@@ -397,7 +450,9 @@ Bot/
 - [Jeremy Whittaker's original article](https://jeremywhittaker.com/index.php/2024/09/24/arbitrage-in-polymarket-com/)
 - [Polymarket](https://polymarket.com/)
 - [BTC 15min Markets](https://polymarket.com/crypto/15M)
-- [py-clob-client documentation](https://github.com/Polymarket/py-clob-client)
+- [py-clob-client-v2 (CLOB V2 SDK)](https://github.com/Polymarket/py-clob-client-v2)
+- [Polymarket CLOB V2 migration guide](https://docs.polymarket.com/v2-migration)
+- [Polymarket contract addresses](https://docs.polymarket.com/resources/contracts)
 
 ---
 

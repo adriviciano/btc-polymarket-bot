@@ -1,11 +1,12 @@
-# Polymarket API client
-py-clob-client
+# Polymarket API client (CLOB V2 — legacy py-clob-client no longer works against production)
+py-clob-client-v2==1.0.1
 
 # WebSocket client for market data (CLOB WSS)
 websockets==12.0
 
-# HTTP client for market discovery and price fetching
-httpx==0.27.0
+# HTTP client for market discovery and price fetching.
+# py-clob-client-v2 needs the http2 extra (uses httpx.Client(http2=True)); >=0.27.0 satisfies the SDK.
+httpx[http2]>=0.27.0
 
 # Environment configuration
 python-dotenv==1.0.1

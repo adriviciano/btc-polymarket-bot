@@ -3,16 +3,16 @@ import logging
 from typing import Optional
 import time
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import (
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import (
     BalanceAllowanceParams,
     AssetType,
     OrderArgs,
     OrderType,
-    PostOrdersArgs,
+    PostOrdersV2Args,
     PartialCreateOrderOptions,
 )
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_builder.constants import BUY, SELL
 
 from .config import Settings
 
@@ -31,27 +31,50 @@ def get_client(settings: Settings) -> ClobClient:
         raise RuntimeError("POLYMARKET_PRIVATE_KEY is required for trading")
     
     host = "https://clob.polymarket.com"
-    
-    # Create client with signature_type=1 for Magic/Email accounts
+
+    # CLOB V2 client. NOTE: the V2 SDK still uses `chain_id` (137 = Polygon); it was NOT
+    # renamed to `chain`. signature_type stays configurable via POLYMARKET_SIGNATURE_TYPE:
+    #   0 = EOA, 1 = POLY_PROXY (Magic/email proxy), 2 = POLY_GNOSIS_SAFE,
+    #   3 = POLY_1271 (EIP-1271 smart-contract wallets / vaults).
     _cached_client = ClobClient(
-        host, 
-        key=settings.private_key.strip(), 
-        chain_id=137, 
-        signature_type=settings.signature_type, 
+        host,
+        chain_id=137,
+        key=settings.private_key.strip(),
+        signature_type=settings.signature_type,
         funder=settings.funder.strip() if settings.funder else None
     )
-    
-    # Derive API credentials - simple method that works
+
+    # Derive API credentials. V2 renamed this method: create_or_derive_api_creds -> create_or_derive_api_key.
     logger.info("Deriving User API credentials from private key...")
-    derived_creds = _cached_client.create_or_derive_api_creds()
+    derived_creds = _cached_client.create_or_derive_api_key()
     _cached_client.set_api_creds(derived_creds)
-    
+
     logger.info("✅ API credentials configured")
     logger.info(f"   API Key: {derived_creds.api_key}")
     logger.info(f"   Wallet: {_cached_client.get_address()}")
     logger.info(f"   Funder: {settings.funder}")
-    
+
+    # CLOB V2 balance/allowance sync. Without this the CLOB can report a stale $0
+    # balance/allowance for funded wallets. The endpoint uses the client's configured
+    # signature_type automatically. Best-effort: don't block startup if it fails.
+    sync_balance_allowance(_cached_client)
+
     return _cached_client
+
+
+def sync_balance_allowance(client: ClobClient) -> None:
+    """Force the CLOB V2 to refresh the cached collateral balance/allowance.
+
+    Calls POST/GET /balance-allowance/update for the COLLATERAL (pUSD) asset. This is the
+    most common fix for "insufficient balance" / $0 balance on a funded V2 wallet.
+    """
+    try:
+        client.update_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        logger.info("✅ CLOB V2 balance/allowance synced (COLLATERAL)")
+    except Exception as e:
+        logger.warning(f"Balance/allowance sync failed (continuing): {e}")
 
 
 def get_balance(settings: Settings) -> float:
@@ -152,7 +175,7 @@ def place_orders_fast(settings: Settings, orders: list[dict], *, order_type: str
 
     # Step 2: Post all orders in a single request when possible.
     try:
-        args = [PostOrdersArgs(order=o, orderType=ot) for o in signed_orders]
+        args = [PostOrdersV2Args(order=o, orderType=ot) for o in signed_orders]
         result = client.post_orders(args)
         if isinstance(result, list):
             return result
