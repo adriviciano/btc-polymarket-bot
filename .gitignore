@@ -3,3 +3,6 @@
 __pycache__/
 .vscode/
 .github/
+
+# Paper-trading data (generated locally)
+paper_trades.csv

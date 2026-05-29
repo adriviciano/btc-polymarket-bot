@@ -345,6 +345,32 @@ Important:
 
 ---
 
+## 🧪 Prediction + backtesting (experimental)
+
+Beyond the pure arbitrage bot, the project includes a research framework to test
+**rules-based directional prediction** on BTC UP/DOWN markets — built *backtest +
+paper first*, before risking any money.
+
+- **`python -m src.backtest`** — reconstructs the UP/DOWN game over real BTC candles
+  (Binance) and reports each strategy's accuracy vs. a modelled break-even price,
+  plus PnL/ROI/profit-factor/drawdown. Options: `--horizon 5 --days 90 --cost 0.03`.
+- **`python -m src.predictor_bot`** — **paper-trading** bot (sends NO orders). Runs two
+  signals on the live Polymarket BTC markets and logs the **real** entry prices and
+  settled outcomes to `paper_trades.csv` so edge can be measured with actual fills:
+  1. **RSI** near the market open (mean reversion).
+  2. **LAG / mispricing** near the close — buy the side that's already winning on BTC
+     spot if Polymarket's lagging book still offers it below its near-certain value.
+  Everything is shown in the live dashboard.
+
+> ⚠️ **Honest status:** backtests on 60 days of BTC show **no robust edge after realistic
+> spread/fees** — trend rules lose; RSI only reaches break-even. The paper bot exists to
+> validate (or reject) edge with real data. **Do not run this against real money** until
+> `paper_trades.csv` shows a clear, consistent positive expectancy.
+
+Tunable via env: `RSI_PERIOD`, `LAG_TRIGGER_S`, `LAG_MIN_BPS`, `LAG_MAX_PRICE`, `PAPER_CSV`.
+
+---
+
 ## 📊 Features
 
 ✅ **Auto-discovers** active BTC 15min market  
