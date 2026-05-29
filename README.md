@@ -270,6 +270,29 @@ python -m src.simple_arb_bot
 
 The bot will scan for opportunities but won't place real orders.
 
+### 📊 Live web dashboard
+
+When you run the bot it automatically launches a small local web dashboard and opens it
+in your browser. It shows, in real time: your pUSD balance, the active market and time
+remaining, current UP/DOWN prices vs. the threshold, scan/opportunity/trade counters,
+open positions, and a live feed of the bot's activity.
+
+- It binds to **localhost only** (`http://127.0.0.1:<port>`), preferring port **8765** and
+  falling back to a random free port if it's taken.
+- The URL is printed in the logs (`📊 Dashboard en vivo: http://127.0.0.1:8765`).
+
+Optional environment variables:
+
+| Variable | Description |
+|----------|-------------|
+| `DASHBOARD_PORT` | Force a specific port instead of 8765 |
+| `DASHBOARD_NO_BROWSER` | Set to `1`/`true` to not auto-open the browser |
+
+You can also run **just** a balance watcher (no trading logic) with:
+```bash
+python -m src.dashboard
+```
+
 ### Optional: WebSocket market data (lower latency)
 
 By default the bot polls the CLOB order book over HTTPS. You can optionally enable

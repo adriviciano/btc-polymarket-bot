@@ -14,6 +14,7 @@ from typing import Optional
 
 import httpx
 
+from . import dashboard
 from .config import load_settings
 from .lookup import fetch_market_from_slug
 from .trading import (
@@ -121,21 +122,48 @@ class SimpleArbitrageBot:
         self.last_check = None
         self.opportunities_found = 0
         self.trades_executed = 0
-        
+        self._scans = 0
+
         # Investment tracking
         self.total_invested = 0.0
         self.total_shares_bought = 0
         self.positions = []  # List of open positions
-        
+
         # Cached balance (updated after each trade)
         self.cached_balance = None
-        
+
         # Simulation balance (used in dry_run mode)
         self.sim_balance = self.settings.sim_balance if self.settings.sim_balance > 0 else 100.0
         self.sim_start_balance = self.sim_balance
 
         # Simple cooldown to avoid repeated orders on the same fleeting opportunity
         self._last_execution_ts = 0.0
+
+        # --- Live web dashboard (best-effort; never blocks the bot) ---
+        self.dash = dashboard.get_state()
+        try:
+            url = dashboard.ensure_started()
+            if url:
+                logger.info(f"📊 Dashboard en vivo: {url}")
+        except Exception as e:
+            logger.warning(f"Dashboard no disponible: {e}")
+        try:
+            init_balance = self.get_balance()
+            if not self.settings.dry_run:
+                self.cached_balance = init_balance
+        except Exception:
+            init_balance = self.sim_balance if self.settings.dry_run else None
+        self.dash.update(
+            mode="SIMULATION" if self.settings.dry_run else "LIVE",
+            balance_label="Saldo simulado (pUSD)" if self.settings.dry_run else "Saldo (pUSD)",
+            balance=round(init_balance, 6) if init_balance is not None else None,
+            market_slug=self.market_slug,
+            up_token=self.yes_token_id,
+            down_token=self.no_token_id,
+            threshold=self.settings.target_pair_cost,
+            order_size=self.settings.order_size,
+            time_remaining=self.get_time_remaining(),
+        )
     
     def get_time_remaining(self) -> str:
         """Get remaining time until market closes."""
@@ -159,6 +187,26 @@ class SimpleArbitrageBot:
             return self.sim_balance
         from .trading import get_balance
         return get_balance(self.settings)
+
+    def _publish_dashboard(self, price_up=None, price_down=None, total_cost=None):
+        """Push the current bot state to the live web dashboard (best-effort)."""
+        try:
+            balance = self.sim_balance if self.settings.dry_run else self.cached_balance
+            expected_profit = sum(float(p.get("expected_profit", 0.0)) for p in (self.positions or []))
+            self.dash.update(
+                time_remaining=self.get_time_remaining(),
+                scans=self._scans,
+                opportunities=self.opportunities_found,
+                trades=(self.opportunities_found if self.settings.dry_run else self.trades_executed),
+                total_invested=round(self.total_invested, 2),
+                expected_profit=round(expected_profit, 2),
+                balance=round(balance, 6) if balance is not None else None,
+                price_up=round(price_up, 4) if price_up is not None else None,
+                price_down=round(price_down, 4) if price_down is not None else None,
+                total_cost=round(total_cost, 4) if total_cost is not None else None,
+            )
+        except Exception:
+            pass
     
     def get_current_prices(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """
@@ -435,6 +483,7 @@ class SimpleArbitrageBot:
             self.total_shares_bought += opportunity['order_size'] * 2  # UP + DOWN
             self.positions.append(opportunity)
             self.trades_executed += 1
+            self._publish_dashboard(opportunity['price_up'], opportunity['price_down'], opportunity['total_cost'])
             logger.info("=" * 70)
             return
         
@@ -582,7 +631,8 @@ class SimpleArbitrageBot:
             new_balance = self.get_balance()
             self.cached_balance = new_balance
             logger.info(f"💰 Updated balance: ${new_balance:.2f}")
-            
+            self._publish_dashboard()
+
             # Get and show current positions
             self.show_current_positions()
             
@@ -597,7 +647,11 @@ class SimpleArbitrageBot:
             
             up_shares = positions.get(self.yes_token_id, {}).get("size", 0)
             down_shares = positions.get(self.no_token_id, {}).get("size", 0)
-            
+            try:
+                self.dash.update(positions={"up": round(float(up_shares), 2), "down": round(float(down_shares), 2)})
+            except Exception:
+                pass
+
             logger.info("-" * 70)
             logger.info("📊 CURRENT POSITIONS:")
             logger.info(f"   UP shares:   {up_shares:.2f}")
@@ -682,12 +736,14 @@ class SimpleArbitrageBot:
         if time_remaining == "CLOSED":
             return False  # Signal to stop the bot
 
+        self._scans += 1
+
         # Fetch both books once per scan (most expensive operations)
         up_book = self.get_order_book(self.yes_token_id)
         down_book = self.get_order_book(self.no_token_id)
 
         opportunity = self.check_arbitrage(up_book=up_book, down_book=down_book)
-        
+
         if opportunity:
             self.execute_arbitrage(opportunity)
             return True
@@ -696,6 +752,10 @@ class SimpleArbitrageBot:
             price_down = down_book.get("best_ask")
             size_up = up_book.get("ask_size", 0)
             size_down = down_book.get("ask_size", 0)
+            self._publish_dashboard(
+                price_up, price_down,
+                (price_up + price_down) if (price_up is not None and price_down is not None) else None,
+            )
 
             if price_up is not None and price_down is not None:
                 best_total = price_up + price_down
@@ -727,6 +787,8 @@ class SimpleArbitrageBot:
         if time_remaining == "CLOSED":
             return False  # Signal to stop the bot
 
+        self._scans += 1
+
         # Fetch both books concurrently (reduces per-scan latency)
         up_book, down_book = await self._fetch_order_books_parallel()
 
@@ -740,6 +802,10 @@ class SimpleArbitrageBot:
         price_down = down_book.get("best_ask")
         size_up = up_book.get("ask_size", 0)
         size_down = down_book.get("ask_size", 0)
+        self._publish_dashboard(
+            price_up, price_down,
+            (price_up + price_down) if (price_up is not None and price_down is not None) else None,
+        )
 
         if price_up is not None and price_down is not None:
             best_total = price_up + price_down
@@ -940,6 +1006,7 @@ class SimpleArbitrageBot:
                         continue
                     last_eval = now
                     eval_count += 1
+                    self._scans += 1
                     logger.info(f"\n[WSS Eval #{eval_count}] {datetime.now().strftime('%H:%M:%S')} (trigger={event_type}:{asset_id[:8]}…)")
 
                     yes_state = client.get_book(self.yes_token_id)
@@ -969,6 +1036,10 @@ class SimpleArbitrageBot:
                     price_down = down_book.get("best_ask")
                     size_up = up_book.get("ask_size", 0)
                     size_down = down_book.get("ask_size", 0)
+                    self._publish_dashboard(
+                        price_up, price_down,
+                        (float(price_up) + float(price_down)) if (price_up is not None and price_down is not None) else None,
+                    )
 
                     if price_up is not None and price_down is not None:
                         best_total = float(price_up) + float(price_down)
