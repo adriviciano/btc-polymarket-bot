@@ -27,8 +27,6 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-import httpx
-
 from . import dashboard
 from .config import load_settings
 from .lookup import fetch_market_from_slug
@@ -41,7 +39,12 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-WINDOW_SECONDS = 900  # btc-updown-15m markets close 15 min after the slug timestamp
+# Market interval (minutes). Polymarket runs btc-updown-{N}m-<epoch> markets that
+# open on aligned N-minute boundaries (epoch divisible by the window) and close one
+# window later. Default 5 min; override with MARKET_MINUTES (e.g. 15).
+MARKET_MINUTES = int(os.getenv("MARKET_MINUTES", "5"))
+WINDOW_SECONDS = MARKET_MINUTES * 60
+SLUG_PREFIX = f"btc-updown-{MARKET_MINUTES}m"
 
 
 @dataclass
@@ -65,18 +68,17 @@ class PaperBet:
 
 
 def find_current_btc_market() -> str:
-    """Return the slug of the current OPEN BTC 15min market."""
-    resp = httpx.get("https://polymarket.com/crypto/15M",
-                     headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-    resp.raise_for_status()
-    matches = re.findall(r"btc-updown-15m-(\d+)", resp.text)
-    if not matches:
-        raise RuntimeError("No active BTC 15min market found")
+    """Return the slug of the BTC market that is open RIGHT NOW.
+
+    These markets open on aligned WINDOW_SECONDS boundaries (epoch divisible by the
+    window) and close exactly one window later, so the live market is computed
+    deterministically: start = floor(now / window) * window. This avoids scraping the
+    listing page, which often shows only future markets and was the cause of the bot
+    locking onto a market a day ahead (TIEMPO RESTANTE in the thousands of minutes).
+    """
     now = int(time.time())
-    all_ts = sorted({int(ts) for ts in matches}, reverse=True)
-    open_ts = [ts for ts in all_ts if now < ts + WINDOW_SECONDS]
-    chosen = open_ts[-1] if open_ts else all_ts[0]
-    return f"btc-updown-15m-{chosen}"
+    start = (now // WINDOW_SECONDS) * WINDOW_SECONDS
+    return f"{SLUG_PREFIX}-{start}"
 
 
 class PredictorBot:
@@ -115,6 +117,7 @@ class PredictorBot:
 
         logger.info("=" * 70)
         logger.info("🧪 PREDICTOR BOT — PAPER MODE (no se envían órdenes reales)")
+        logger.info(f"   Mercado: {SLUG_PREFIX} (ventana {WINDOW_SECONDS}s = {MARKET_MINUTES}min)")
         logger.info(f"   Señales: RSI-open (period {self.rsi_period}) + LAG near-expiry "
                     f"(<{self.lag_trigger_s}s, ask≤{self.lag_max_price})")
         logger.info(f"   Tamaño paper: {self.size} shares | CSV: {self.csv_path}")
@@ -150,7 +153,7 @@ class PredictorBot:
     def load_market(self):
         slug = find_current_btc_market()
         info = fetch_market_from_slug(slug)
-        m = re.search(r"btc-updown-15m-(\d+)", slug)
+        m = re.search(rf"{SLUG_PREFIX}-(\d+)", slug)
         start = int(m.group(1))
         btc_open = self._btc_price_at(start)
         self.market = {
