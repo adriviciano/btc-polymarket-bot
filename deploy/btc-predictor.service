@@ -1,0 +1,29 @@
+[Unit]
+Description=BTC Polymarket predictor (paper) bot + web dashboard
+# Wait until the network is actually up before starting (markets/Binance need it).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- EDIT THESE TWO if you install the unit by hand (the install script fills
+#     them in for you automatically): ---
+User=__USER__
+WorkingDirectory=__PROJECT_DIR__
+
+# Expose the dashboard on the whole LAN (so you can open it from your laptop/phone),
+# fix the port, and don't try to open a browser (the Pi is headless).
+Environment=DASHBOARD_HOST=0.0.0.0
+Environment=DASHBOARD_PORT=8765
+Environment=DASHBOARD_NO_BROWSER=1
+# Flush stdout immediately so `journalctl -f` shows logs live.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=__PROJECT_DIR__/.venv/bin/python -m src.predictor_bot
+
+# Keep it alive: if the bot crashes or the network blips, restart after 5s.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

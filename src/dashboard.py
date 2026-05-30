@@ -262,18 +262,18 @@ def _make_handler(state: DashboardState):
     return Handler
 
 
-def _pick_port(preferred: int) -> int:
+def _pick_port(preferred: int, host: str = "127.0.0.1") -> int:
     candidates = [preferred] + [random.randint(8000, 9899) for _ in range(30)]
     for port in candidates:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind(("127.0.0.1", port))
+            s.bind((host, port))
             s.close()
             return port
         except OSError:
             continue
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
+    s.bind((host, 0))
     port = s.getsockname()[1]
     s.close()
     return port
@@ -302,9 +302,14 @@ def ensure_started(preferred_port: int = 8765, open_browser: bool = True):
             except ValueError:
                 pass
 
-        port = _pick_port(preferred_port)
+        # Bind host: 127.0.0.1 by default (only reachable from this machine).
+        # Set DASHBOARD_HOST=0.0.0.0 to expose it on the LAN (e.g. a headless
+        # Raspberry Pi you want to reach from your laptop/phone).
+        host = (os.getenv("DASHBOARD_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+
+        port = _pick_port(preferred_port, host)
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(_STATE))
+            server = ThreadingHTTPServer((host, port), _make_handler(_STATE))
         except OSError as e:
             logger.warning(f"Could not start dashboard server: {e}")
             return None
@@ -313,7 +318,7 @@ def ensure_started(preferred_port: int = 8765, open_browser: bool = True):
                                   name="dashboard-http")
         thread.start()
         _SERVER = server
-        _URL = f"http://127.0.0.1:{port}"
+        _URL = f"http://{host}:{port}"
         _STARTED = True
 
         if open_browser and os.getenv("DASHBOARD_NO_BROWSER", "").lower() not in ("1", "true"):
