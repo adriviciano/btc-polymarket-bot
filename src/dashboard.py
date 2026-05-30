@@ -16,6 +16,7 @@ import os
 import random
 import socket
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -262,16 +263,35 @@ def _make_handler(state: DashboardState):
     return Handler
 
 
-def _pick_port(preferred: int, host: str = "127.0.0.1") -> int:
-    candidates = [preferred] + [random.randint(8000, 9899) for _ in range(30)]
-    for port in candidates:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.bind((host, port))
-            s.close()
+def _can_bind(host: str, port: int) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _pick_port(preferred: int, host: str = "127.0.0.1", insist: bool = False) -> int:
+    # When a fixed port was requested (e.g. DASHBOARD_PORT, for a stable URL), retry it
+    # for a few seconds before giving up: on a service restart the previous instance may
+    # still hold the port for ~1s, and silently jumping to a random port makes the
+    # dashboard "disappear" from its usual address.
+    attempts = 12 if insist else 1
+    for i in range(attempts):
+        if _can_bind(host, preferred):
+            return preferred
+        if i < attempts - 1:
+            time.sleep(0.5)
+    if insist:
+        logger.warning(f"Port {preferred} still busy after retries; falling back to a random port")
+    for _ in range(30):
+        port = random.randint(8000, 9899)
+        if _can_bind(host, port):
             return port
-        except OSError:
-            continue
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((host, 0))
     port = s.getsockname()[1]
@@ -296,9 +316,11 @@ def ensure_started(preferred_port: int = 8765, open_browser: bool = True):
             handler.addFilter(lambda r: r.levelno >= logging.INFO)
 
         env_port = os.getenv("DASHBOARD_PORT") or os.getenv("POLYMARKET_DASHBOARD_PORT")
+        insist = False
         if env_port:
             try:
                 preferred_port = int(env_port)
+                insist = True  # an explicit port means the user wants a stable URL
             except ValueError:
                 pass
 
@@ -307,7 +329,7 @@ def ensure_started(preferred_port: int = 8765, open_browser: bool = True):
         # Raspberry Pi you want to reach from your laptop/phone).
         host = (os.getenv("DASHBOARD_HOST") or "127.0.0.1").strip() or "127.0.0.1"
 
-        port = _pick_port(preferred_port, host)
+        port = _pick_port(preferred_port, host, insist=insist)
         try:
             server = ThreadingHTTPServer((host, port), _make_handler(_STATE))
         except OSError as e:
