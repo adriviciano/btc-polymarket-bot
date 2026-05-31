@@ -47,6 +47,13 @@ WINDOW_SECONDS = MARKET_MINUTES * 60
 SLUG_PREFIX = f"btc-updown-{MARKET_MINUTES}m"
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 @dataclass
 class PaperBet:
     market: str
@@ -88,11 +95,24 @@ class PredictorBot:
         self.size = float(settings.order_size)
 
         # signal parameters (tunable via env)
+        # RSI showed no edge in paper -> set ENABLE_RSI=false to run LAG-only.
+        self.enable_rsi = _env_bool("ENABLE_RSI", True)
+        self.enable_lag = _env_bool("ENABLE_LAG", True)
         self.rsi_open_window_s = int(os.getenv("RSI_OPEN_WINDOW_S", "90"))
         self.rsi_period = int(os.getenv("RSI_PERIOD", "14"))
-        self.lag_trigger_s = int(os.getenv("LAG_TRIGGER_S", "120"))   # consider lag bet when <120s left
-        self.lag_min_bps = float(os.getenv("LAG_MIN_BPS", "5"))        # BTC moved > 5 bps from open
-        self.lag_max_price = float(os.getenv("LAG_MAX_PRICE", "0.90")) # only buy a favorite below this
+        self.lag_trigger_s = int(os.getenv("LAG_TRIGGER_S", "120"))   # consider lag bet when <Ns left
+        self.lag_min_bps = float(os.getenv("LAG_MIN_BPS", "5"))        # BTC moved > N bps from open
+        # Only buy a favorite at/below this ask. The break-even ask equals the win rate,
+        # so any ask above your measured LAG win rate is -EV. Measured ~0.875 over the
+        # first paper sample -> 0.80 keeps a safety margin and cuts the thin-edge bets.
+        self.lag_max_price = float(os.getenv("LAG_MAX_PRICE", "0.80"))
+        # Edge-scaled paper stake: the cheaper the favorite (= bigger book lag = bigger
+        # edge), the more shares we stake. Scales linearly from LAG_ORDER_SIZE at
+        # lag_max_price up to LAG_ORDER_SIZE_MAX at LAG_CHEAP_REF (and stays at the max
+        # below that). Defaults to a flat ORDER_SIZE when the two sizes are equal.
+        self.lag_size = float(os.getenv("LAG_ORDER_SIZE", str(self.size)))
+        self.lag_size_max = float(os.getenv("LAG_ORDER_SIZE_MAX", str(self.lag_size)))
+        self.lag_cheap_ref = float(os.getenv("LAG_CHEAP_REF", "0.55"))
         self.csv_path = os.getenv("PAPER_CSV", "paper_trades.csv")
 
         self.client = get_client(settings)
@@ -118,26 +138,62 @@ class PredictorBot:
         logger.info("=" * 70)
         logger.info("🧪 PREDICTOR BOT — PAPER MODE (no se envían órdenes reales)")
         logger.info(f"   Mercado: {SLUG_PREFIX} (ventana {WINDOW_SECONDS}s = {MARKET_MINUTES}min)")
-        logger.info(f"   Señales: RSI-open (period {self.rsi_period}) + LAG near-expiry "
-                    f"(<{self.lag_trigger_s}s, ask≤{self.lag_max_price})")
-        logger.info(f"   Tamaño paper: {self.size} shares | CSV: {self.csv_path}")
+        active = ", ".join(s for s, on in (("RSI", self.enable_rsi), ("LAG", self.enable_lag)) if on) or "NINGUNA"
+        logger.info(f"   Señales activas: {active}")
+        if self.enable_rsi:
+            logger.info(f"   RSI-open period {self.rsi_period} (ventana {self.rsi_open_window_s}s)")
+        if self.enable_lag:
+            logger.info(f"   LAG <{self.lag_trigger_s}s, move≥{self.lag_min_bps}bps, ask≤{self.lag_max_price}")
+        if self.lag_size_max > self.lag_size:
+            logger.info(f"   Tamaño paper LAG: {self.lag_size:g}→{self.lag_size_max:g} shares "
+                        f"(escala por edge, máx en ask≤{self.lag_cheap_ref}) | CSV: {self.csv_path}")
+        else:
+            logger.info(f"   Tamaño paper: {self.size:g} shares | CSV: {self.csv_path}")
         logger.info("=" * 70)
 
     # --- helpers ----------------------------------------------------------
-    def _best_ask(self, token_id: str) -> Tuple[Optional[float], float]:
+    def _ask_levels(self, token_id: str) -> List[Tuple[float, float]]:
+        """Ask book as (price, size) levels sorted by price ascending ([] on error)."""
         try:
             book = self.client.get_order_book(token_id=token_id)
             asks = book.get("asks") if isinstance(book, dict) else getattr(book, "asks", None)
-            best_p, best_s = None, 0.0
+            levels = []
             for lvl in (asks or []):
                 p = float(lvl["price"]) if isinstance(lvl, dict) else float(lvl.price)
                 s = float(lvl["size"]) if isinstance(lvl, dict) else float(lvl.size)
-                if best_p is None or p < best_p:
-                    best_p, best_s = p, s
-            return best_p, best_s
+                levels.append((p, s))
+            levels.sort(key=lambda x: x[0])
+            return levels
         except Exception as e:
-            logger.debug(f"best_ask error: {e}")
+            logger.debug(f"ask_levels error: {e}")
+            return []
+
+    def _best_ask(self, token_id: str) -> Tuple[Optional[float], float]:
+        levels = self._ask_levels(token_id)
+        return levels[0] if levels else (None, 0.0)
+
+    def _fill_for_size(self, token_id: str, want: float, max_price: float
+                       ) -> Tuple[Optional[float], float]:
+        """Simulate a marketable buy of ``want`` shares with a ``max_price`` limit.
+
+        Walks the asks from the cheapest level, taking only levels priced at or below
+        ``max_price``, and returns the volume-weighted average fill price plus the
+        shares actually filled (which can be < want when the book is thin). This models
+        a real limit order far better than assuming the whole size fills at the best ask
+        — slippage that matters once LAG sizes are scaled up. By construction the avg
+        price never exceeds ``max_price``.
+        """
+        remaining, cost, filled = want, 0.0, 0.0
+        for price, size in self._ask_levels(token_id):
+            if price > max_price or remaining <= 0:
+                break
+            take = min(remaining, size)
+            cost += take * price
+            filled += take
+            remaining -= take
+        if filled <= 0:
             return None, 0.0
+        return cost / filled, round(filled, 2)
 
     def _btc_price_at(self, epoch_s: int) -> Optional[float]:
         """BTC open price of the 1m candle covering epoch_s (Binance)."""
@@ -176,24 +232,39 @@ class PredictorBot:
         return int(self.market["end"] - time.time()) if self.market else 0
 
     # --- signals ----------------------------------------------------------
+    def _lag_size_for(self, ask: float) -> float:
+        """Edge-scaled paper stake for a LAG bet.
+
+        Cheaper favorite == bigger book lag == bigger edge, so we stake more. Scales
+        linearly from ``lag_size`` at ``lag_max_price`` up to ``lag_size_max`` at
+        ``lag_cheap_ref`` (clamped both ends). When the two sizes are equal it returns
+        the flat size, so behaviour is unchanged unless LAG_ORDER_SIZE_MAX is set.
+        """
+        if self.lag_size_max <= self.lag_size or self.lag_max_price <= self.lag_cheap_ref:
+            return self.lag_size
+        frac = (self.lag_max_price - ask) / (self.lag_max_price - self.lag_cheap_ref)
+        frac = max(0.0, min(1.0, frac))
+        return round(self.lag_size + frac * (self.lag_size_max - self.lag_size), 2)
+
     def _place_paper_bet(self, signal: str, side: str, token_id: str,
-                         entry_price: float, btc_now: float):
+                         entry_price: float, btc_now: float, size: Optional[float] = None):
         key = f"{self.market['slug']}:{signal}"
         if key in self.open_bets:
             return
+        size = self.size if size is None else size
         bet = PaperBet(
             market=self.market["slug"], signal=signal, side=side,
-            entry_price=round(entry_price, 4), size=self.size,
+            entry_price=round(entry_price, 4), size=size,
             placed_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             time_left_s=self.time_left(), btc_open=self.market["btc_open"] or 0.0,
             btc_at_entry=btc_now, window_end=self.market["end"], token_id=token_id,
         )
         self.open_bets[key] = bet
         self.totals["bets"] += 1
-        self.totals["staked"] += self.size * entry_price
-        stake = self.size * entry_price
+        self.totals["staked"] += size * entry_price
+        stake = size * entry_price
         logger.info(f"📝 PAPER {signal} bet {side} @ {entry_price:.3f} "
-                    f"(stake ${stake:.2f}, {self.time_left()}s left, BTC ${btc_now:.0f})")
+                    f"(stake ${stake:.2f}, {size:g} sh, {self.time_left()}s left, BTC ${btc_now:.0f})")
 
     def evaluate_signals(self):
         if not self.market:
@@ -209,7 +280,7 @@ class PredictorBot:
 
         # --- Signal 1: RSI near the open ---
         rsi_key = f"{self.market['slug']}:RSI"
-        if 0 <= elapsed <= self.rsi_open_window_s and rsi_key not in self.open_bets:
+        if self.enable_rsi and 0 <= elapsed <= self.rsi_open_window_s and rsi_key not in self.open_bets:
             try:
                 candles = get_klines("BTCUSDT", "1m", limit=max(self.rsi_period + 6, 30))
                 sig = evaluate("rsi", candles, {"period": self.rsi_period})
@@ -224,7 +295,7 @@ class PredictorBot:
 
         # --- Signal 2: LAG / mispricing near the close ---
         lag_key = f"{self.market['slug']}:LAG"
-        if (0 < left <= self.lag_trigger_s and lag_key not in self.open_bets
+        if (self.enable_lag and 0 < left <= self.lag_trigger_s and lag_key not in self.open_bets
                 and self.market["btc_open"] and btc_now):
             move_bps = (btc_now - self.market["btc_open"]) / self.market["btc_open"] * 10_000
             if abs(move_bps) >= self.lag_min_bps:
@@ -232,9 +303,12 @@ class PredictorBot:
                 token = self.market["yes"] if leader == "UP" else self.market["no"]
                 ask, ask_sz = self._best_ask(token)
                 if ask is not None and ask <= self.lag_max_price and ask_sz >= 1:
-                    logger.info(f"⚡ LAG -> {leader} winning by {move_bps:+.0f}bps, "
-                                f"ask {ask:.3f} ≤ {self.lag_max_price} (cheap favorite)")
-                    self._place_paper_bet("LAG", leader, token, ask, btc_now)
+                    want = self._lag_size_for(ask)
+                    avg_price, filled = self._fill_for_size(token, want, self.lag_max_price)
+                    if avg_price is not None and filled >= 1:
+                        logger.info(f"⚡ LAG -> {leader} winning by {move_bps:+.0f}bps, "
+                                    f"best {ask:.3f}, fill {filled:g}/{want:g} sh @ avg {avg_price:.3f}")
+                        self._place_paper_bet("LAG", leader, token, avg_price, btc_now, size=filled)
 
     # --- settlement -------------------------------------------------------
     def settle_due(self):

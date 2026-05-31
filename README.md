@@ -74,9 +74,13 @@ This is not really a prediction — it exploits Polymarket's order book reacting
 than BTC's spot price. In the last `LAG_TRIGGER_S` seconds before close:
 - If BTC has already moved ≥ `LAG_MIN_BPS` from the market's open price, the winning
   side is nearly decided.
-- If that near-certain winner is still buyable at `ask ≤ LAG_MAX_PRICE` (e.g. ≤ $0.90)
+- If that near-certain winner is still buyable at `ask ≤ LAG_MAX_PRICE` (default `0.80`)
   with at least 1 share of depth, it buys it, betting it settles at $1.
-Closer to arbitrage than to forecasting.
+Closer to arbitrage than to forecasting. The break-even ask equals the win rate, so the
+default cap stays below the measured LAG win rate (an ask above it is −EV). The paper
+stake is **edge-scaled** (cheaper favorite ⇒ more shares, see `LAG_ORDER_SIZE_MAX`) and the
+entry price/size come from **walking the ask book** under a `LAG_MAX_PRICE` limit — so a
+thin book yields a worse average price and a partial fill, like a real limit order.
 
 ### Reading the dashboard
 
@@ -97,11 +101,16 @@ Closer to arbitrage than to forecasting.
 | Variable | Default | What it controls |
 |----------|---------|------------------|
 | `MARKET_MINUTES` | `5` | Market interval to follow (`5` or `15`). |
+| `ENABLE_RSI` | `true` | Master switch for the RSI signal. Set `false` to run **LAG-only** (RSI showed no edge in paper). |
+| `ENABLE_LAG` | `true` | Master switch for the LAG signal. |
 | `RSI_OPEN_WINDOW_S` | `90` | How long after the open the RSI signal stays active. |
 | `RSI_PERIOD` | `14` | RSI lookback period. |
-| `LAG_TRIGGER_S` | `120` | How close to the close the LAG signal activates. |
+| `LAG_TRIGGER_S` | `120` | How close to the close the LAG signal activates. Lower it (e.g. `75`) to bet nearer the close, where reversals are rarer. |
 | `LAG_MIN_BPS` | `5` | Min BTC move from open (basis points) to trust the LAG signal. |
-| `LAG_MAX_PRICE` | `0.90` | Only buy a favorite priced at or below this. |
+| `LAG_MAX_PRICE` | `0.80` | Only buy a favorite priced at or below this. The break-even ask equals the win rate, so an ask above the measured LAG win rate is −EV. |
+| `LAG_ORDER_SIZE` | `ORDER_SIZE` | Base shares for a LAG bet (at `LAG_MAX_PRICE`). |
+| `LAG_ORDER_SIZE_MAX` | `LAG_ORDER_SIZE` | Max shares for a LAG bet, reached at `LAG_CHEAP_REF`. Set above `LAG_ORDER_SIZE` to stake more on cheaper (higher-edge) favorites; leave equal for a flat size. |
+| `LAG_CHEAP_REF` | `0.55` | Ask at (and below) which LAG sizing maxes out. |
 | `ORDER_SIZE` | `50`* | Paper position size (shares). Same variable as the arb bot; the shipped `.env.example` sets it to `5`. |
 | `PAPER_CSV` | `paper_trades.csv` | Output file for settled paper trades. |
 
