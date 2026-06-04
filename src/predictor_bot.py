@@ -19,6 +19,7 @@ Everything is published to the live dashboard. Run:
 import argparse
 import asyncio
 import csv
+import json
 import logging
 import os
 import re
@@ -72,6 +73,68 @@ class PaperBet:
     btc_close: float = 0.0
     won: bool = False
     pnl: float = 0.0
+    quoted_ask: float = 0.0  # best ask AT decision time (vs entry_price = realized fill)
+
+
+class AdaptiveSlippage:
+    """Self-tuning entry ceiling that learns real slippage and protects the EV edge.
+
+    The bot decides on the *quoted* best ask but actually pays the *realized* fill
+    price (worse, because filling size walks the book — and in live trading also
+    because of latency and competition eating the cheap level first). This tracks an
+    EMA of ``realized - quoted`` and lowers the effective LAG_MAX_PRICE by that gap,
+    so the price we ACTUALLY pay stays under the EV ceiling instead of the price we
+    hoped to pay. In paper mode ``realized`` is the book-walk average; in live mode it
+    is the exchange fill — identical code path, so the controller keeps adapting once
+    real money (and its bigger slippage) is in play. State is persisted so the learned
+    slippage survives restarts.
+    """
+
+    def __init__(self, base_max: float, floor: float, alpha: float,
+                 path: str, enabled: bool):
+        self.base_max = base_max          # configured LAG_MAX_PRICE (upper bound)
+        self.floor = floor                # never tighten below this
+        self.alpha = alpha                # EMA weight on the newest observation
+        self.path = path
+        self.enabled = enabled
+        self.slip_ema = 0.0
+        self.n = 0
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            self.slip_ema = float(d.get("slip_ema", 0.0))
+            self.n = int(d.get("n", 0))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug(f"adaptive load error: {e}")
+
+    def _save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"slip_ema": round(self.slip_ema, 6), "n": self.n,
+                           "base_max": self.base_max}, f)
+        except Exception as e:
+            logger.debug(f"adaptive save error: {e}")
+
+    def effective_max(self) -> float:
+        """Current LAG_MAX_PRICE after subtracting learned slippage (clamped)."""
+        if not self.enabled:
+            return self.base_max
+        eff = self.base_max - max(0.0, self.slip_ema)
+        return round(max(self.floor, min(self.base_max, eff)), 4)
+
+    def observe(self, quoted: float, realized: float) -> float:
+        """Feed one (quoted, realized) pair; returns the new effective ceiling."""
+        slip = realized - quoted
+        self.slip_ema = slip if self.n == 0 else (
+            (1 - self.alpha) * self.slip_ema + self.alpha * slip)
+        self.n += 1
+        self._save()
+        return self.effective_max()
 
 
 def find_current_btc_market() -> str:
@@ -95,17 +158,31 @@ class PredictorBot:
         self.size = float(settings.order_size)
 
         # signal parameters (tunable via env)
-        # RSI showed no edge in paper -> set ENABLE_RSI=false to run LAG-only.
-        self.enable_rsi = _env_bool("ENABLE_RSI", True)
+        # RSI showed no edge in paper -> default OFF (LAG-only). Set ENABLE_RSI=true to re-enable.
+        self.enable_rsi = _env_bool("ENABLE_RSI", False)
         self.enable_lag = _env_bool("ENABLE_LAG", True)
         self.rsi_open_window_s = int(os.getenv("RSI_OPEN_WINDOW_S", "90"))
         self.rsi_period = int(os.getenv("RSI_PERIOD", "14"))
         self.lag_trigger_s = int(os.getenv("LAG_TRIGGER_S", "120"))   # consider lag bet when <Ns left
-        self.lag_min_bps = float(os.getenv("LAG_MIN_BPS", "5"))        # BTC moved > N bps from open
+        # BTC must have moved >= N bps from the open. Raised 5 -> 8: the paper sample
+        # showed <8 bps trades are net -EV (winrate 70% but you pay ~74c for it), while
+        # >=8 bps carry a real +EV edge (the book lag only appears after a clear move).
+        self.lag_min_bps = float(os.getenv("LAG_MIN_BPS", "8"))
         # Only buy a favorite at/below this ask. The break-even ask equals the win rate,
-        # so any ask above your measured LAG win rate is -EV. Measured ~0.875 over the
-        # first paper sample -> 0.80 keeps a safety margin and cuts the thin-edge bets.
-        self.lag_max_price = float(os.getenv("LAG_MAX_PRICE", "0.80"))
+        # so any ask above your measured LAG win rate is -EV. The >=0.78 bucket was a
+        # net loser in the paper sample -> 0.75 cuts the expensive thin-edge bets. The
+        # AdaptiveSlippage controller lowers the *effective* ceiling further to absorb
+        # realized-vs-quoted slippage (see below).
+        self.lag_max_price = float(os.getenv("LAG_MAX_PRICE", "0.75"))
+        # Self-tuning ceiling: learns realized-vs-quoted slippage and protects the edge.
+        self.lag_adaptive = _env_bool("LAG_ADAPTIVE", True)
+        self.adaptive = AdaptiveSlippage(
+            base_max=self.lag_max_price,
+            floor=float(os.getenv("LAG_MAX_PRICE_FLOOR", "0.55")),
+            alpha=float(os.getenv("LAG_SLIP_ALPHA", "0.1")),
+            path=os.getenv("PREDICTOR_STATE", "predictor_state.json"),
+            enabled=self.lag_adaptive,
+        )
         # Edge-scaled paper stake: the cheaper the favorite (= bigger book lag = bigger
         # edge), the more shares we stake. Scales linearly from LAG_ORDER_SIZE at
         # lag_max_price up to LAG_ORDER_SIZE_MAX at LAG_CHEAP_REF (and stays at the max
@@ -144,6 +221,9 @@ class PredictorBot:
             logger.info(f"   RSI-open period {self.rsi_period} (ventana {self.rsi_open_window_s}s)")
         if self.enable_lag:
             logger.info(f"   LAG <{self.lag_trigger_s}s, move≥{self.lag_min_bps}bps, ask≤{self.lag_max_price}")
+            if self.lag_adaptive:
+                logger.info(f"   LAG adaptativo ON: techo efectivo {self.adaptive.effective_max():.3f} "
+                            f"(slippage aprendido {self.adaptive.slip_ema:+.3f} sobre {self.adaptive.n} fills)")
         if self.lag_size_max > self.lag_size:
             logger.info(f"   Tamaño paper LAG: {self.lag_size:g}→{self.lag_size_max:g} shares "
                         f"(escala por edge, máx en ask≤{self.lag_cheap_ref}) | CSV: {self.csv_path}")
@@ -247,7 +327,8 @@ class PredictorBot:
         return round(self.lag_size + frac * (self.lag_size_max - self.lag_size), 2)
 
     def _place_paper_bet(self, signal: str, side: str, token_id: str,
-                         entry_price: float, btc_now: float, size: Optional[float] = None):
+                         entry_price: float, btc_now: float, size: Optional[float] = None,
+                         quoted_ask: Optional[float] = None):
         key = f"{self.market['slug']}:{signal}"
         if key in self.open_bets:
             return
@@ -258,6 +339,7 @@ class PredictorBot:
             placed_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             time_left_s=self.time_left(), btc_open=self.market["btc_open"] or 0.0,
             btc_at_entry=btc_now, window_end=self.market["end"], token_id=token_id,
+            quoted_ask=round(quoted_ask if quoted_ask is not None else entry_price, 4),
         )
         self.open_bets[key] = bet
         self.totals["bets"] += 1
@@ -301,14 +383,18 @@ class PredictorBot:
             if abs(move_bps) >= self.lag_min_bps:
                 leader = "UP" if move_bps > 0 else "DOWN"
                 token = self.market["yes"] if leader == "UP" else self.market["no"]
+                eff_max = self.adaptive.effective_max()
                 ask, ask_sz = self._best_ask(token)
-                if ask is not None and ask <= self.lag_max_price and ask_sz >= 1:
+                if ask is not None and ask <= eff_max and ask_sz >= 1:
                     want = self._lag_size_for(ask)
-                    avg_price, filled = self._fill_for_size(token, want, self.lag_max_price)
+                    avg_price, filled = self._fill_for_size(token, want, eff_max)
                     if avg_price is not None and filled >= 1:
+                        new_eff = self.adaptive.observe(ask, avg_price)
                         logger.info(f"⚡ LAG -> {leader} winning by {move_bps:+.0f}bps, "
-                                    f"best {ask:.3f}, fill {filled:g}/{want:g} sh @ avg {avg_price:.3f}")
-                        self._place_paper_bet("LAG", leader, token, avg_price, btc_now, size=filled)
+                                    f"best {ask:.3f}, fill {filled:g}/{want:g} sh @ avg {avg_price:.3f} "
+                                    f"(ceil {eff_max:.3f}, slip {self.adaptive.slip_ema:+.3f} -> ceil {new_eff:.3f})")
+                        self._place_paper_bet("LAG", leader, token, avg_price, btc_now,
+                                              size=filled, quoted_ask=ask)
 
     # --- settlement -------------------------------------------------------
     def settle_due(self):

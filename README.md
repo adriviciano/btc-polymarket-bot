@@ -5,7 +5,7 @@ two independent bots, a research backtester, and a shared live web dashboard:
 
 | Component | Command | What it does | Risks money? |
 |-----------|---------|--------------|:---:|
-| 🧪 **Predictor bot** | `python -m src.predictor_bot` | **Paper-trades** BTC UP/DOWN markets to measure whether two signals (RSI + lag) actually have edge. Logs real entry prices and settled outcomes to a CSV. | ❌ Never (paper) |
+| 🧪 **Predictor bot** | `python -m src.predictor_bot` | **Paper-trades** BTC UP/DOWN markets to measure real edge. Runs **LAG-only** by default (the one signal that showed edge; RSI is off). Logs real entry prices, the quoted vs realized fill, and settled outcomes to a CSV. | ❌ Never (paper) |
 | 💱 **Arbitrage bot** | `python -m src.simple_arb_bot` | Buys **both** sides (UP + DOWN) when their combined price is `< $1`, for a guaranteed spread. Has a `DRY_RUN` simulation mode. | ⚠️ Only if `DRY_RUN=false` |
 | 📈 **Backtester** | `python -m src.backtest` | Replays the UP/DOWN game over real historical BTC candles and reports each strategy's accuracy and P&L vs. a break-even price. | ❌ Never |
 | 📊 **Dashboard** | (auto-starts) | Live web page showing balance, prices, counters and the bot's activity feed. Started automatically by either bot. | ❌ Never |
@@ -74,13 +74,30 @@ This is not really a prediction — it exploits Polymarket's order book reacting
 than BTC's spot price. In the last `LAG_TRIGGER_S` seconds before close:
 - If BTC has already moved ≥ `LAG_MIN_BPS` from the market's open price, the winning
   side is nearly decided.
-- If that near-certain winner is still buyable at `ask ≤ LAG_MAX_PRICE` (default `0.80`)
+- If that near-certain winner is still buyable at `ask ≤ LAG_MAX_PRICE` (default `0.75`)
   with at least 1 share of depth, it buys it, betting it settles at $1.
 Closer to arbitrage than to forecasting. The break-even ask equals the win rate, so the
 default cap stays below the measured LAG win rate (an ask above it is −EV). The paper
 stake is **edge-scaled** (cheaper favorite ⇒ more shares, see `LAG_ORDER_SIZE_MAX`) and the
-entry price/size come from **walking the ask book** under a `LAG_MAX_PRICE` limit — so a
-thin book yields a worse average price and a partial fill, like a real limit order.
+entry price/size come from **walking the ask book** under the effective `LAG_MAX_PRICE`
+limit — so a thin book yields a worse average price and a partial fill, like a real limit
+order.
+
+> **Why those defaults?** Over a 299-trade paper sample the edge concentrated in **clear
+> moves bought cheap**: trades with a BTC move `< 8 bps` were net −EV (≈70% win but you pay
+> ~74¢ for it), and any ask `≥ 0.78` was a net loser — so the defaults rose to
+> `LAG_MIN_BPS=8` and dropped to `LAG_MAX_PRICE=0.75`. Remember `edge = winrate − price`
+> (the EV per share): a high win rate still loses money if the price you pay is higher.
+
+**Adaptive ceiling (auto-tuning).** The bot decides on the *quoted* best ask but actually
+pays the *realized* fill (worse — size walks the book, and live trading adds latency and
+competition). `AdaptiveSlippage` tracks an EMA of `realized − quoted` and lowers the
+**effective** `LAG_MAX_PRICE` by that learned gap, so the price you really pay stays under
+the EV ceiling instead of the price you hoped to pay. It persists to
+`predictor_state.json`, so the learned slippage survives restarts; in paper it learns the
+book-walk cost, and once real orders run (same code path) it absorbs their bigger slippage
+automatically. Disable with `LAG_ADAPTIVE=false`. The CSV records `quoted_ask` next to the
+realized `entry_price` precisely so this gap is measurable.
 
 ### Reading the dashboard
 
@@ -101,13 +118,17 @@ thin book yields a worse average price and a partial fill, like a real limit ord
 | Variable | Default | What it controls |
 |----------|---------|------------------|
 | `MARKET_MINUTES` | `5` | Market interval to follow (`5` or `15`). |
-| `ENABLE_RSI` | `true` | Master switch for the RSI signal. Set `false` to run **LAG-only** (RSI showed no edge in paper). |
+| `ENABLE_RSI` | `false` | Master switch for the RSI signal. Default **off** (RSI showed no edge in paper) → the bot runs **LAG-only**. Set `true` to re-enable. |
 | `ENABLE_LAG` | `true` | Master switch for the LAG signal. |
 | `RSI_OPEN_WINDOW_S` | `90` | How long after the open the RSI signal stays active. |
 | `RSI_PERIOD` | `14` | RSI lookback period. |
 | `LAG_TRIGGER_S` | `120` | How close to the close the LAG signal activates. Lower it (e.g. `75`) to bet nearer the close, where reversals are rarer. |
-| `LAG_MIN_BPS` | `5` | Min BTC move from open (basis points) to trust the LAG signal. |
-| `LAG_MAX_PRICE` | `0.80` | Only buy a favorite priced at or below this. The break-even ask equals the win rate, so an ask above the measured LAG win rate is −EV. |
+| `LAG_MIN_BPS` | `8` | Min BTC move from open (basis points) to trust the LAG signal. Below `8` the paper sample was net −EV (no real book lag yet). |
+| `LAG_MAX_PRICE` | `0.75` | Only buy a favorite priced at or below this. The break-even ask equals the win rate, so an ask above the measured LAG win rate is −EV (the `≥0.78` bucket lost money). The adaptive controller lowers the *effective* value further. |
+| `LAG_ADAPTIVE` | `true` | Self-tune the effective `LAG_MAX_PRICE` from learned `realized − quoted` slippage. Set `false` for a fixed ceiling. |
+| `LAG_SLIP_ALPHA` | `0.1` | EMA weight on the newest fill when learning slippage (higher = adapts faster, noisier). |
+| `LAG_MAX_PRICE_FLOOR` | `0.55` | The adaptive controller never tightens the effective ceiling below this. |
+| `PREDICTOR_STATE` | `predictor_state.json` | Where the learned slippage is persisted (survives restarts). |
 | `LAG_ORDER_SIZE` | `ORDER_SIZE` | Base shares for a LAG bet (at `LAG_MAX_PRICE`). |
 | `LAG_ORDER_SIZE_MAX` | `LAG_ORDER_SIZE` | Max shares for a LAG bet, reached at `LAG_CHEAP_REF`. Set above `LAG_ORDER_SIZE` to stake more on cheaper (higher-edge) favorites; leave equal for a flat size. |
 | `LAG_CHEAP_REF` | `0.55` | Ask at (and below) which LAG sizing maxes out. |
@@ -119,6 +140,29 @@ It also accepts `--poll <seconds>` (default `3`) for the loop interval.
 > Note: with 5-minute markets the RSI (first 90s) and LAG (last 120s) windows cover
 > most of the 300s cycle. Tightening them (e.g. `RSI_OPEN_WINDOW_S=60`,
 > `LAG_TRIGGER_S=90`) keeps each signal closer to its ideal moment.
+
+### Analyzing the paper trades
+
+`paper_trades.csv` is the whole point of the paper run, so the repo root ships a set of
+standalone analysis scripts that read it and print breakdowns — no extra dependencies
+(pure stdlib, **no pandas**). Run any of them from the project root once the CSV has rows:
+
+```bash
+python analyze_lag.py          # start here
+```
+
+| Script | What it answers |
+|--------|-----------------|
+| `analyze_lag.py` | Main LAG report (Spanish output): wins/losses, gross won vs lost, net P&L, avg win/avg loss, plus net per **day / entry price / BTC move / UTC hour / seconds-left / side**. The go-to overview. |
+| `analyze_edge.py` | The core concept: **`edge = winrate − price`** (EV per share). Tabulates realized win rate vs the price paid per BTC-move bucket, so you see where the bot pays *more* than its true win odds (−EV) vs less (+EV). |
+| `analyze_trades.py` | Full bucketed breakdown (entry price, time-left, move, hour, side, by day) with win rate **and** ROI, plus a reversal check (avg move/time/price on wins vs losses). |
+| `analyze_filters.py` | **What-if filters**: simulates win rate + P&L if you only kept e.g. `entry ≤ 0.72`, `move ≥ 8 bps`, dropped a bad hour, or combinations — and the `corr(move, entry)` that proves the lag edge. |
+| `analyze_capacity.py` | Throughput + **liquidity** reality: trades/day, shares and `$`/trade the book actually absorbed, and a (fractional-Kelly) sizing sanity check. |
+| `analyze_target.py` | Reverse-solves the **stake/bankroll** needed to hit a `$/month` target under optimistic/realistic/pessimistic edge haircuts. Edit the `TARGET` constant at the top. |
+
+> These are research helpers, not part of the bot — they never trade and only read the CSV.
+> They are intentionally left un-gitignored so you can tweak the thresholds and re-run as
+> more paper data accumulates. The numbers in the defaults above came from these scripts.
 
 ---
 
@@ -295,8 +339,16 @@ btc-polymarket-bot/
 │   ├── config.py          # .env loader
 │   ├── generate_api_key.py / test_balance.py / diagnose_config.py   # utilities
 │   └── __init__.py
+├── analyze_lag.py         # 🔎 LAG paper-trade reports (see "Analyzing the paper trades")
+├── analyze_edge.py        # 🔎 edge = winrate − price, per BTC-move bucket
+├── analyze_trades.py      # 🔎 full bucketed breakdown + ROI
+├── analyze_filters.py     # 🔎 what-if filter simulations
+├── analyze_capacity.py    # 🔎 throughput + liquidity / sizing sanity check
+├── analyze_target.py      # 🔎 stake/bankroll needed for a $/month target
 ├── deploy/                # systemd service + install script
 ├── .env.example           # configuration template
+├── paper_trades.csv       # generated: settled paper trades (gitignored)
+├── predictor_state.json   # generated: learned adaptive slippage (gitignored)
 ├── requirements.txt
 └── README.md
 ```

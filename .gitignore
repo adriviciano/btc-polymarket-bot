@@ -6,3 +6,6 @@ __pycache__/
 
 # Paper-trading data (generated locally)
 paper_trades.csv
+
+# Adaptive controller state (learned slippage, regenerated at runtime)
+predictor_state.json
