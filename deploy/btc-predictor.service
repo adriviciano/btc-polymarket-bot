@@ -3,6 +3,11 @@ Description=BTC Polymarket predictor (paper) bot + web dashboard
 # Wait until the network is actually up before starting (markets/Binance need it).
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting. With the default rate limit, a flapping crash/watchdog loop
+# (e.g. a long network outage) trips StartLimitBurst and systemd STOPS the unit for good
+# — exactly the multi-day silent outage seen in the paper log. 0 disables the limit so
+# Restart=always is truly always.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

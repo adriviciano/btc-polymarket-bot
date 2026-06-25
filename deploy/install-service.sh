@@ -47,6 +47,9 @@ sudo tee "$UNIT" >/dev/null <<EOF
 Description=BTC Polymarket predictor (paper) bot + web dashboard
 After=network-online.target
 Wants=network-online.target
+# 0 = never give up restarting (a flapping loop must not trip the start limit and stop
+# the unit permanently, which is what caused the multi-day gaps in the paper log).
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

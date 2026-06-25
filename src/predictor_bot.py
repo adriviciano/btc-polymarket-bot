@@ -23,6 +23,8 @@ import json
 import logging
 import os
 import re
+import sys
+import threading
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -46,6 +48,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 MARKET_MINUTES = int(os.getenv("MARKET_MINUTES", "5"))
 WINDOW_SECONDS = MARKET_MINUTES * 60
 SLUG_PREFIX = f"btc-updown-{MARKET_MINUTES}m"
+
+# Hang protection. The CLOB SDK calls (get_order_book) have no internal timeout, so a
+# dropped connection can freeze a tick forever — the process stays "alive" (systemd
+# Restart=always never fires) but stops trading. This explains the multi-hour gaps in
+# the paper log. A watchdog thread force-exits the process if a tick hasn't completed
+# within WATCHDOG_TIMEOUT seconds; systemd then restarts it cleanly within seconds.
+WATCHDOG_TIMEOUT = float(os.getenv("WATCHDOG_TIMEOUT", "120"))
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -164,6 +173,10 @@ class PredictorBot:
         self.rsi_open_window_s = int(os.getenv("RSI_OPEN_WINDOW_S", "90"))
         self.rsi_period = int(os.getenv("RSI_PERIOD", "14"))
         self.lag_trigger_s = int(os.getenv("LAG_TRIGGER_S", "120"))   # consider lag bet when <Ns left
+        # ...but NOT when too little time is left. The paper sample showed bets placed
+        # with <40s remaining won only 43% (avg -1.40/trade) — a clear -EV tail (late,
+        # thin-edge entries). Floor the entry window so the bot bets in [floor, trigger]s.
+        self.lag_min_time_left = int(os.getenv("LAG_MIN_TIME_LEFT", "45"))
         # BTC must have moved >= N bps from the open. Raised 5 -> 8: the paper sample
         # showed <8 bps trades are net -EV (winrate 70% but you pay ~74c for it), while
         # >=8 bps carry a real +EV edge (the book lag only appears after a clear move).
@@ -206,6 +219,7 @@ class PredictorBot:
         self.history: List[PaperBet] = []
         self.totals = {"bets": 0, "wins": 0, "pnl": 0.0, "staked": 0.0}
         self._ticks = 0
+        self._last_progress = time.time()   # heartbeat for the hang watchdog
 
         try:
             self.start_balance = get_balance(settings)
@@ -220,7 +234,8 @@ class PredictorBot:
         if self.enable_rsi:
             logger.info(f"   RSI-open period {self.rsi_period} (ventana {self.rsi_open_window_s}s)")
         if self.enable_lag:
-            logger.info(f"   LAG <{self.lag_trigger_s}s, move≥{self.lag_min_bps}bps, ask≤{self.lag_max_price}")
+            logger.info(f"   LAG entrada {self.lag_min_time_left}–{self.lag_trigger_s}s, "
+                        f"move≥{self.lag_min_bps}bps, ask≤{self.lag_max_price}")
             if self.lag_adaptive:
                 logger.info(f"   LAG adaptativo ON: techo efectivo {self.adaptive.effective_max():.3f} "
                             f"(slippage aprendido {self.adaptive.slip_ema:+.3f} sobre {self.adaptive.n} fills)")
@@ -377,7 +392,8 @@ class PredictorBot:
 
         # --- Signal 2: LAG / mispricing near the close ---
         lag_key = f"{self.market['slug']}:LAG"
-        if (self.enable_lag and 0 < left <= self.lag_trigger_s and lag_key not in self.open_bets
+        if (self.enable_lag and self.lag_min_time_left <= left <= self.lag_trigger_s
+                and lag_key not in self.open_bets
                 and self.market["btc_open"] and btc_now):
             move_bps = (btc_now - self.market["btc_open"]) / self.market["btc_open"] * 10_000
             if abs(move_bps) >= self.lag_min_bps:
@@ -479,9 +495,36 @@ class PredictorBot:
         self.evaluate_signals()
         self.settle_due()
         self.publish(up_ask, down_ask)
+        self._last_progress = time.time()  # tick completed -> feed the watchdog
+
+    def _start_watchdog(self):
+        """Force-exit if a tick stalls past WATCHDOG_TIMEOUT so systemd can restart us.
+
+        The CLOB SDK has no per-call timeout; a frozen socket would otherwise hang the
+        loop silently for hours. Network I/O releases the GIL, so this daemon thread
+        keeps running even while the main thread is blocked, and os._exit guarantees the
+        process actually dies (sys.exit would just raise in the stuck thread).
+        """
+        if WATCHDOG_TIMEOUT <= 0:
+            return
+
+        def _watch():
+            while True:
+                time.sleep(min(WATCHDOG_TIMEOUT / 4, 15))
+                stalled = time.time() - self._last_progress
+                if stalled > WATCHDOG_TIMEOUT:
+                    logger.error(f"⏱️ WATCHDOG: tick congelado {stalled:.0f}s "
+                                 f"(>{WATCHDOG_TIMEOUT:.0f}s). Forzando salida para reinicio.")
+                    sys.stderr.flush()
+                    os._exit(1)
+
+        threading.Thread(target=_watch, name="watchdog", daemon=True).start()
+        logger.info(f"🐕 Watchdog activo: salida forzada si un tick supera {WATCHDOG_TIMEOUT:.0f}s")
 
     async def run(self):
         logger.info("🚀 Predictor bot iniciado (PAPER). Ctrl+C para parar.")
+        self._last_progress = time.time()
+        self._start_watchdog()
         try:
             while True:
                 self.tick()
